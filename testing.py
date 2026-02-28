@@ -147,7 +147,7 @@ def get_cik_for_ticker(ticker):
 
 
 # Test it
-ticker_name = input("Please enter a ticker: ")
+ticker_name = input("Please enter a ticker name: ")
 cik = get_cik_for_ticker(ticker_name)
 print("CIK: ", cik)
 get_financials_by_cik(cik)
