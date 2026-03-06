@@ -65,18 +65,13 @@ import requests
 import pandas as pd
 
 def get_financials_by_cik(cik):
-    # Ensure CIK is 10 digits with leading zeros
     cik_padded = str(cik).zfill(10)
-    
-    # SEC requires a descriptive User-Agent
     headers = {
-        'User-Agent': "Rahul Goel (rahulgol97@gmail.com)",
-        'Accept-Encoding': 'gzip, deflate'
+        "User-Agent": "Rahul Goel (rahulgol97@gmail.com)",
+        "Accept-Encoding": "gzip, deflate"
     }
-
-    # API Endpoint for all company facts
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
-    
+
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -84,49 +79,117 @@ def get_financials_by_cik(cik):
     except Exception as e:
         return f"Error fetching data: {e}"
 
-    # Get Company Name from the metadata
-    company_name = data.get('entityName', 'Unknown')
-    
-    # Financial concepts we want (GAAP tags)
-    # Note: Revenue tags vary by industry; we check common ones
-    concepts = {
-        "Revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingVat", "SalesRevenueNet"],
-        "OpIncome": ["OperatingIncomeLoss"]
+    company_name = data.get("entityName", "Unknown")
+    facts = data.get("facts", {}).get("us-gaap", {})
+
+    revenue_tags = [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingVat",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet"
+    ]
+    op_income_tag = "OperatingIncomeLoss"
+
+    results = {
+        "Annual": {},
+        "Quarterly": {}
     }
 
-    results = {"Annual": {}, "Quarterly": {}}
+    def extract_max_per_period(series, period_type):
+        records = {}
+        for entry in series:
+            if "segment" in entry:
+                continue
+            val = entry.get("val")
+            if val is None or val <= 0:
+                continue
+            if period_type == "Annual":
+                period_key = entry.get("fy")
+            else:
+                period_key = entry.get("end")
+            if period_key not in records or val > records[period_key]["val"]:
+                records[period_key] = {
+                    "val": val,
+                    "form": entry.get("form"),
+                    "fy": entry.get("fy"),
+                    "fp": entry.get("fp"),
+                    "end": entry.get("end"),
+                    "tag": entry.get("concept", "")
+                }
+        sorted_keys = sorted(records.keys())
+        return [records[k] for k in sorted_keys]
 
-    for label, tags in concepts.items():
-        found = False
-        for tag in tags:
-            if tag in data['facts']['us-gaap']:
-                series = data['facts']['us-gaap'][tag]['units']['USD']
-                
-                # Filter for 10-K (Annual) and 10-Q (Quarterly)
-                annuals = [f for f in series if f['form'] == '10-K']
-                quarters = [f for f in series if f['form'] == '10-Q']
-                
-                if annuals:
-                    results["Annual"][label] = annuals[-1]['val']
-                if quarters:
-                    results["Quarterly"][label] = quarters[-1]['val']
-                
-                found = True
-                break # Stop searching tags once one is found
-        
-        if not found:
-            results["Annual"][label] = "N/A"
-            results["Quarterly"][label] = "N/A"
+    # Revenue
+    for tag in revenue_tags:
+        if tag not in facts:
+            continue
+        units = facts[tag].get("units", {})
+        if "USD" not in units:
+            continue
+        series = units["USD"]
+        ann = extract_max_per_period(series, "Annual")
+        qtr = extract_max_per_period(series, "Quarterly")
+        for r in ann:
+            fy = r["fy"]
+            if fy not in results["Annual"] or r["val"] > results["Annual"][fy]["val"]:
+                results["Annual"][fy] = r
+        for r in qtr:
+            end = r["end"]
+            if end not in results["Quarterly"] or r["val"] > results["Quarterly"][end]["val"]:
+                results["Quarterly"][end] = r
 
-    return (
-        f"Company Name: {company_name}, CIK: {cik_padded}\n"
-        f"--- Most Recent Year (10-K) ---\n"
-        f"Revenue: {results['Annual'].get('Revenue'):,}\n"
-        f"Operating Income: {results['Annual'].get('OpIncome'):,}\n"
-        f"--- Most Recent Quarter (10-Q) ---\n"
-        f"Revenue: {results['Quarterly'].get('Revenue'):,}\n"
-        f"Operating Income: {results['Quarterly'].get('OpIncome'):,}"
-    )
+    # Operating Income
+    if op_income_tag in facts:
+        units = facts[op_income_tag].get("units", {})
+        if "USD" in units:
+            series = units["USD"]
+            ann = extract_max_per_period(series, "Annual")
+            qtr = extract_max_per_period(series, "Quarterly")
+            for r in ann:
+                fy = r["fy"]
+                if fy not in results["Annual"] or r["val"] > results["Annual"][fy]["val"]:
+                    results["Annual"][fy] = r
+            for r in qtr:
+                end = r["end"]
+                if end not in results["Quarterly"] or r["val"] > results["Quarterly"][end]["val"]:
+                    results["Quarterly"][end] = r
+
+    # Convert cumulative quarterly to per-quarter
+    quarterly_sorted = sorted(results["Quarterly"].values(), key=lambda x: x["end"])
+    per_quarter = []
+    prev_val = {}
+    for r in quarterly_sorted:
+        fy = r["fy"]
+        if fy not in prev_val:
+            actual = r["val"]
+        else:
+            actual = r["val"] - prev_val[fy]
+        prev_val[fy] = r["val"]
+        r_copy = r.copy()
+        r_copy["val"] = actual
+        per_quarter.append(r_copy)
+
+    annual_list = [results["Annual"][k] for k in sorted(results["Annual"])]
+    quarterly_list = per_quarter
+
+    # Print
+    print("CIK:", cik_padded)
+    print("Company:", company_name)
+    print("Annual Revenue & Operating Income (max per fiscal year):")
+    for r in annual_list:
+        print(r)
+    print("\nQuarterly Revenue & Operating Income (per quarter):")
+    for r in quarterly_list:
+        print(r)
+
+    return {
+        "Company": company_name,
+        "CIK": cik_padded,
+        "Annual": annual_list,
+        "Quarterly": quarterly_list
+    }
+
+
 
 
 def get_cik_for_ticker(ticker):
